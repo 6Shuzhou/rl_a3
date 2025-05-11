@@ -9,16 +9,6 @@ import matplotlib
 matplotlib.use('Agg')  # headless backend (no GUI needed)
 import matplotlib.pyplot as plt
 
-"""
-PPO‑Clip on CartPole‑v1 (PyTorch)
----------------------------------
-* Trains for a **fixed 1 million timesteps** (no early stop).
-* Logs 100‑episode moving‑average reward and saves a learning‑curve plot.
-* Minimal but extensible reference implementation.
-
-Author: ChatGPT (OpenAI o3)
-"""
-
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
@@ -105,7 +95,7 @@ def ppo_update(model, optimizer, clip_eps, obs, actions, old_log_probs, returns,
 
 def train(seed=42,
           env_id="CartPole-v1",
-          total_timesteps=1_000_000,
+          total_timesteps=500_000,
           rollout_len=2048,
           update_epochs=10,
           batch_size=64,
