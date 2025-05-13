@@ -48,7 +48,11 @@ class ActorCritic(nn.Module):
 def gae(rew, val, dones, next_v, gamma=0.99, lam=0.95):
     """Generalised Advantage Estimation (GAE‑λ)."""
     adv, g = [], 0.0
+    
+    # Append next value to bootstrap the final step
     val = np.append(val, next_v)
+    
+    # Work backwards from end of rollout
     for t in reversed(range(len(rew))):
         delta = rew[t] + gamma * val[t + 1] * (1 - dones[t]) - val[t]
         g = delta + gamma * lam * (1 - dones[t]) * g
@@ -65,6 +69,8 @@ def ppo_update(model, opt, clip_eps, obs, act, logp_old, ret, adv,
     logp_old = torch.tensor(logp_old, dtype=torch.float32, device=device)
     ret = torch.tensor(ret, dtype=torch.float32, device=device)
     adv = torch.tensor(adv, dtype=torch.float32, device=device)
+    
+    # Normalize advantage to stabilize training
     adv = (adv - adv.mean()) / (adv.std() + 1e-8)
 
     n = obs.size(0)
@@ -74,9 +80,12 @@ def ppo_update(model, opt, clip_eps, obs, act, logp_old, ret, adv,
             b = idx[st:st + batch]
             b_obs, b_act = obs[b], act[b]
             b_old, b_ret, b_adv = logp_old[b], ret[b], adv[b]
-
+            
+            # Evaluate current policy
             logp, ent, v = model.evaluate(b_obs, b_act)
             ratio = torch.exp(logp - b_old)
+            
+            # PPO clipped surrogate objective
             surr1 = ratio * b_adv
             surr2 = torch.clamp(ratio, 1 - clip_eps, 1 + clip_eps) * b_adv
             pi_loss = -torch.min(surr1, surr2).mean()
@@ -99,7 +108,7 @@ def train(seed: int = 42,
           batch: int = 64,
           gamma: float = 0.99,
           lam: float = 0.95,
-          clip_eps: float = 0.1,
+          clip_eps: float = 0.2,
           actor_lr: float = 3e-4,
           critic_lr: float = 1e-4,
           hidden=(64, 64),
@@ -161,6 +170,7 @@ def train(seed: int = 42,
             ep_buf.append(ep_ret)
             ep_ret = 0.0
 
+        # When enough steps collected, perform PPO update
         if len(o_buf) == rollout:
             obs_t = torch.tensor(obs, dtype=torch.float32, device=device).unsqueeze(0)
             with torch.no_grad():
@@ -173,13 +183,14 @@ def train(seed: int = 42,
 
             o_buf.clear(); a_buf.clear(); logp_buf.clear();
             r_buf.clear(); d_buf.clear(); v_buf.clear()
-
+            
+            # Log performance once buffer of episodes filled
             if len(ep_buf) == ep_buf.maxlen:
                 avg_r = np.mean(ep_buf)
                 t_log.append(steps)
                 r_log.append(avg_r)
                 update_idx += 1
-                print(f"Run {run_id} | Upd {update_idx:4d} | Steps {steps:7d} | AvgR(100ep) {avg_r:6.2f}")
+                print(f"Run {run_id} | Upd {update_idx:4d} | Steps {steps:7d} | AvgR {avg_r:6.2f}")
 
     env.close()
 
@@ -188,7 +199,7 @@ def train(seed: int = 42,
         plt.figure()
         plt.plot(t_log, r_log)
         plt.xlabel('Environment steps')
-        plt.ylabel('Average Reward (100‑episode MA)')
+        plt.ylabel('Average Reward ')
         plt.title(f'PPO on {env_id} – Run {run_id}')
         plt.grid(True)
         fname = f'learning_curve_run{run_id}.png'
@@ -209,8 +220,9 @@ def run_multiple(repeats: int = 5, **train_kwargs):
                              **{k: v for k, v in train_kwargs.items() if k not in ('seed', 'run_id')})
         steps_list.append(t_log)
         curves.append(r_log)
-
-    # Align lengths (they should already match)
+        
+        
+    # Truncate to shortest curve length for averaging
     min_len = min(len(c) for c in curves)
     curves = [c[:min_len] for c in curves]
     steps_axis = steps_list[0][:min_len]
@@ -220,7 +232,7 @@ def run_multiple(repeats: int = 5, **train_kwargs):
     plt.figure()
     plt.plot(steps_axis, avg_curve)
     plt.xlabel('Environment steps')
-    plt.ylabel('Average Reward (100‑episode MA)')
+    plt.ylabel('Average Reward')
     plt.title(f'PPO on CartPole‑v1 ')
     plt.grid(True)
     plt.savefig('learning_curve_avg.png')
@@ -228,5 +240,4 @@ def run_multiple(repeats: int = 5, **train_kwargs):
 
 
 if __name__ == '__main__':
-    # Run 5 times (default) and plot averaged learning curve
-    run_multiple(repeats=1, total_steps=1_000_000)
+    run_multiple(repeats=5, total_steps=1_000_000)
