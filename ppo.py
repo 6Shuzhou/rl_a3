@@ -6,9 +6,10 @@ import torch.optim as optim
 from torch.distributions.categorical import Categorical
 from collections import deque
 import matplotlib
-matplotlib.use('Agg')  # for headless environments
+matplotlib.use('Agg')  # non‑interactive backend
 import matplotlib.pyplot as plt
 
+# Choose GPU if available
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
@@ -45,6 +46,7 @@ class ActorCritic(nn.Module):
 
 
 def gae(rew, val, dones, next_v, gamma=0.99, lam=0.95):
+    """Generalised Advantage Estimation (GAE‑λ)."""
     adv, g = [], 0.0
     val = np.append(val, next_v)
     for t in reversed(range(len(rew))):
@@ -57,6 +59,7 @@ def gae(rew, val, dones, next_v, gamma=0.99, lam=0.95):
 
 def ppo_update(model, opt, clip_eps, obs, act, logp_old, ret, adv,
                batch, epochs, vf_coef=0.5, ent_coef=0.01, max_grad=0.5):
+    """One full PPO optimisation phase (multiple minibatch epochs)."""
     obs = torch.tensor(obs, dtype=torch.float32, device=device)
     act = torch.tensor(act, dtype=torch.int64, device=device)
     logp_old = torch.tensor(logp_old, dtype=torch.float32, device=device)
@@ -88,19 +91,25 @@ def ppo_update(model, opt, clip_eps, obs, act, logp_old, ret, adv,
             opt.step()
 
 
-def train(seed=42,
-          env_id="CartPole-v1",
-          total_steps=1_000_000,
-          rollout=2048,
-          epochs=10,
-          batch=64,
-          gamma=0.99,
-          lam=0.95,
-          clip_eps=0.2,
-          actor_lr=3e-4,
-          critic_lr=1e-4,
+def train(seed: int = 42,
+          env_id: str = "CartPole-v1",
+          total_steps: int = 1_000_000,
+          rollout: int = 2048,
+          epochs: int = 10,
+          batch: int = 64,
+          gamma: float = 0.99,
+          lam: float = 0.95,
+          clip_eps: float = 0.1,
+          actor_lr: float = 3e-4,
+          critic_lr: float = 1e-4,
           hidden=(64, 64),
-          plot=True):
+          run_id: int = 1,
+          plot: bool = False):
+    """Train PPO for a single run and return (steps, rewards).
+
+    Each element of the returned lists corresponds to *one PPO update*.
+    The x‑axis is cumulative environment steps (not update index).
+    """
     env = gym.make(env_id)
     env.reset(seed=seed)
     np.random.seed(seed); torch.manual_seed(seed)
@@ -110,7 +119,7 @@ def train(seed=42,
 
     model = ActorCritic(obs_dim, act_dim, hidden).to(device)
 
-    # parameter groups: shared + policy use actor_lr, value uses critic_lr
+    # Separate LR for actor/critic
     actor_params = list(model.shared.parameters()) + list(model.policy.parameters())
     critic_params = model.value.parameters()
     opt = optim.Adam([
@@ -125,7 +134,8 @@ def train(seed=42,
     # rollout buffers
     o_buf, a_buf, logp_buf, r_buf, d_buf, v_buf = ([] for _ in range(6))
 
-    t_log, r_log = [], []
+    t_log, r_log = [], []  # cumulative steps, moving‑average reward
+    update_idx = 0
 
     while steps < total_steps:
         obs_t = torch.tensor(obs, dtype=torch.float32, device=device).unsqueeze(0)
@@ -168,22 +178,55 @@ def train(seed=42,
                 avg_r = np.mean(ep_buf)
                 t_log.append(steps)
                 r_log.append(avg_r)
-                print(f"Steps: {steps}\tAvg Reward (100‑ep MA): {avg_r:.2f}")
+                update_idx += 1
+                print(f"Run {run_id} | Upd {update_idx:4d} | Steps {steps:7d} | AvgR(100ep) {avg_r:6.2f}")
 
     env.close()
 
-    if plot and t_log:
+    # Optional single‑run plot
+    if plot and r_log:
         plt.figure()
         plt.plot(t_log, r_log)
-        plt.xlabel('Timesteps')
+        plt.xlabel('Environment steps')
         plt.ylabel('Average Reward (100‑episode MA)')
-        plt.title('PPO on CartPole‑v1 ')
+        plt.title(f'PPO on {env_id} – Run {run_id}')
         plt.grid(True)
-        plt.savefig('learning_curve.png')
-        print('Saved learning_curve.png')
+        fname = f'learning_curve_run{run_id}.png'
+        plt.savefig(fname)
+        print(f'Saved {fname}')
 
-    return model
+    return t_log, r_log
+
+
+def run_multiple(repeats: int = 5, **train_kwargs):
+    """Run PPO *repeats* times and plot the mean learning curve vs *steps*."""
+    steps_list, curves = [], []
+    for i in range(repeats):
+        print(f"========== Run {i + 1}/{repeats} ==========")
+        t_log, r_log = train(seed=train_kwargs.get('seed', 42) + i,
+                             run_id=i + 1,
+                             plot=False,
+                             **{k: v for k, v in train_kwargs.items() if k not in ('seed', 'run_id')})
+        steps_list.append(t_log)
+        curves.append(r_log)
+
+    # Align lengths (they should already match)
+    min_len = min(len(c) for c in curves)
+    curves = [c[:min_len] for c in curves]
+    steps_axis = steps_list[0][:min_len]
+    avg_curve = np.mean(curves, axis=0)
+
+    # Plot mean curve
+    plt.figure()
+    plt.plot(steps_axis, avg_curve)
+    plt.xlabel('Environment steps')
+    plt.ylabel('Average Reward (100‑episode MA)')
+    plt.title(f'PPO on CartPole‑v1 ')
+    plt.grid(True)
+    plt.savefig('learning_curve_avg.png')
+    print('Saved learning_curve_avg.png')
 
 
 if __name__ == '__main__':
-    train()
+    # Run 5 times (default) and plot averaged learning curve
+    run_multiple(repeats=1, total_steps=1_000_000)
