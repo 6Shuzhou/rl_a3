@@ -95,14 +95,14 @@ def ppo_update(model, optimizer, clip_eps, obs, actions, old_log_probs, returns,
 
 def train(seed=42,
           env_id="CartPole-v1",
-          total_timesteps=500_000,
+          total_timesteps=1000000,
           rollout_len=2048,
           update_epochs=10,
           batch_size=64,
           gamma=0.99,
           lam=0.95,
-          clip_eps=0.2,
-          lr=3e-4,
+          clip_eps=0.15,
+          lr=0.0001,
           hidden_sizes=(64, 64),
           plot=True):
     """Train PPO for exactly `total_timesteps` and return the trained model."""
