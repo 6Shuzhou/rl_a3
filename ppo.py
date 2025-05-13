@@ -6,188 +6,184 @@ import torch.optim as optim
 from torch.distributions.categorical import Categorical
 from collections import deque
 import matplotlib
-matplotlib.use('Agg')  # headless backend (no GUI needed)
+matplotlib.use('Agg')  # for headless environments
 import matplotlib.pyplot as plt
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
 class ActorCritic(nn.Module):
-    """Shared two‑layer MLP with separate policy (actor) and value (critic) heads."""
+    """Two‑layer MLP shared trunk with separate policy and value heads."""
 
-    def __init__(self, obs_dim: int, act_dim: int, hidden_sizes=(64, 64)):
+    def __init__(self, obs_dim: int, act_dim: int, hidden=(64, 64)):
         super().__init__()
         layers = []
         last = obs_dim
-        for h in hidden_sizes:
+        for h in hidden:
             layers += [nn.Linear(last, h), nn.Tanh()]
             last = h
         self.shared = nn.Sequential(*layers)
-        self.policy_head = nn.Linear(last, act_dim)
-        self.value_head = nn.Linear(last, 1)
+        self.policy = nn.Linear(last, act_dim)
+        self.value = nn.Linear(last, 1)
 
     def forward(self, x):
         feat = self.shared(x)
-        return self.policy_head(feat), self.value_head(feat)
+        return self.policy(feat), self.value(feat)
 
     def act(self, obs):
-        logits, value = self.forward(obs)
+        logits, v = self.forward(obs)
         dist = Categorical(logits=logits)
-        action = dist.sample()
-        return action, dist.log_prob(action), dist.entropy(), value.squeeze(-1)
+        a = dist.sample()
+        return a, dist.log_prob(a), dist.entropy(), v.squeeze(-1)
 
-    def evaluate_actions(self, obs, actions):
-        logits, value = self.forward(obs)
+    def evaluate(self, obs, actions):
+        logits, v = self.forward(obs)
         dist = Categorical(logits=logits)
-        log_probs = dist.log_prob(actions)
-        entropy = dist.entropy()
-        return log_probs, entropy, value.squeeze(-1)
+        logp = dist.log_prob(actions)
+        ent = dist.entropy()
+        return logp, ent, v.squeeze(-1)
 
 
-def compute_gae(rewards, values, dones, next_value, gamma=0.99, lam=0.95):
-    """Generalised Advantage Estimation."""
-    adv = []
-    gae = 0.0
-    values = np.append(values, next_value)
-    for t in reversed(range(len(rewards))):
-        delta = rewards[t] + gamma * values[t + 1] * (1 - dones[t]) - values[t]
-        gae = delta + gamma * lam * (1 - dones[t]) * gae
-        adv.insert(0, gae)
-    ret = adv + values[:-1].tolist()
-    return np.array(adv, dtype=np.float32), np.array(ret, dtype=np.float32)
+def gae(rew, val, dones, next_v, gamma=0.99, lam=0.95):
+    adv, g = [], 0.0
+    val = np.append(val, next_v)
+    for t in reversed(range(len(rew))):
+        delta = rew[t] + gamma * val[t + 1] * (1 - dones[t]) - val[t]
+        g = delta + gamma * lam * (1 - dones[t]) * g
+        adv.insert(0, g)
+    ret = adv + val[:-1].tolist()
+    return np.array(adv, np.float32), np.array(ret, np.float32)
 
 
-def ppo_update(model, optimizer, clip_eps, obs, actions, old_log_probs, returns, advantages,
-               batch_size, epochs, vf_coef=0.5, ent_coef=0.01, max_grad_norm=0.5):
+def ppo_update(model, opt, clip_eps, obs, act, logp_old, ret, adv,
+               batch, epochs, vf_coef=0.5, ent_coef=0.01, max_grad=0.5):
     obs = torch.tensor(obs, dtype=torch.float32, device=device)
-    actions = torch.tensor(actions, dtype=torch.int64, device=device)
-    old_log_probs = torch.tensor(old_log_probs, dtype=torch.float32, device=device)
-    returns = torch.tensor(returns, dtype=torch.float32, device=device)
-    advantages = torch.tensor(advantages, dtype=torch.float32, device=device)
-    advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+    act = torch.tensor(act, dtype=torch.int64, device=device)
+    logp_old = torch.tensor(logp_old, dtype=torch.float32, device=device)
+    ret = torch.tensor(ret, dtype=torch.float32, device=device)
+    adv = torch.tensor(adv, dtype=torch.float32, device=device)
+    adv = (adv - adv.mean()) / (adv.std() + 1e-8)
 
     n = obs.size(0)
     for _ in range(epochs):
         idx = torch.randperm(n)
-        for start in range(0, n, batch_size):
-            batch_idx = idx[start:start + batch_size]
-            b_obs = obs[batch_idx]
-            b_actions = actions[batch_idx]
-            b_old_log = old_log_probs[batch_idx]
-            b_returns = returns[batch_idx]
-            b_adv = advantages[batch_idx]
+        for st in range(0, n, batch):
+            b = idx[st:st + batch]
+            b_obs, b_act = obs[b], act[b]
+            b_old, b_ret, b_adv = logp_old[b], ret[b], adv[b]
 
-            log_probs, entropy, values = model.evaluate_actions(b_obs, b_actions)
-            ratio = torch.exp(log_probs - b_old_log)
+            logp, ent, v = model.evaluate(b_obs, b_act)
+            ratio = torch.exp(logp - b_old)
             surr1 = ratio * b_adv
             surr2 = torch.clamp(ratio, 1 - clip_eps, 1 + clip_eps) * b_adv
-            policy_loss = -torch.min(surr1, surr2).mean()
-            value_loss = nn.functional.mse_loss(values, b_returns)
-            entropy_loss = -entropy.mean()
+            pi_loss = -torch.min(surr1, surr2).mean()
+            v_loss = nn.functional.mse_loss(v, b_ret)
+            ent_loss = -ent.mean()
 
-            loss = policy_loss + vf_coef * value_loss + ent_coef * entropy_loss
+            loss = pi_loss + vf_coef * v_loss + ent_coef * ent_loss
 
-            optimizer.zero_grad()
+            opt.zero_grad()
             loss.backward()
-            nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
-            optimizer.step()
+            nn.utils.clip_grad_norm_(model.parameters(), max_grad)
+            opt.step()
 
 
 def train(seed=42,
           env_id="CartPole-v1",
-          total_timesteps=1000000,
-          rollout_len=2048,
-          update_epochs=10,
-          batch_size=64,
+          total_steps=1_000_000,
+          rollout=2048,
+          epochs=10,
+          batch=64,
           gamma=0.99,
           lam=0.95,
-          clip_eps=0.15,
-          lr=0.0001,
-          hidden_sizes=(64, 64),
+          clip_eps=0.2,
+          actor_lr=3e-4,
+          critic_lr=1e-4,
+          hidden=(64, 64),
           plot=True):
-    """Train PPO for exactly `total_timesteps` and return the trained model."""
     env = gym.make(env_id)
     env.reset(seed=seed)
-    torch.manual_seed(seed)
-    np.random.seed(seed)
+    np.random.seed(seed); torch.manual_seed(seed)
 
     obs_dim = env.observation_space.shape[0]
     act_dim = env.action_space.n
 
-    model = ActorCritic(obs_dim, act_dim, hidden_sizes).to(device)
-    optimizer = optim.Adam(model.parameters(), lr=lr, eps=1e-5)
+    model = ActorCritic(obs_dim, act_dim, hidden).to(device)
 
-    obs = env.reset()[0]
-    ep_rewards = deque(maxlen=100)
-    ep_reward = 0.0
-    timesteps = 0
+    # parameter groups: shared + policy use actor_lr, value uses critic_lr
+    actor_params = list(model.shared.parameters()) + list(model.policy.parameters())
+    critic_params = model.value.parameters()
+    opt = optim.Adam([
+        {'params': actor_params, 'lr': actor_lr},
+        {'params': critic_params, 'lr': critic_lr}
+    ], eps=1e-5)
 
-    # rollout storage
-    ro_obs, ro_actions, ro_logp, ro_rewards, ro_dones, ro_values = ([] for _ in range(6))
+    obs, _ = env.reset()
+    ep_buf = deque(maxlen=100)
+    ep_ret, steps = 0.0, 0
 
-    # progress logging
-    prog_timesteps, prog_avg_r = [], []
+    # rollout buffers
+    o_buf, a_buf, logp_buf, r_buf, d_buf, v_buf = ([] for _ in range(6))
 
-    while timesteps < total_timesteps:
+    t_log, r_log = [], []
+
+    while steps < total_steps:
         obs_t = torch.tensor(obs, dtype=torch.float32, device=device).unsqueeze(0)
         with torch.no_grad():
-            action, logp, _, value = model.act(obs_t)
-        next_obs, reward, done, truncated, _ = env.step(action.item())
-        terminated = done or truncated
+            a, logp, _, v = model.act(obs_t)
+        new_obs, rew, term, trunc, _ = env.step(a.item())
+        done = term or trunc
 
-        # store
-        ro_obs.append(obs)
-        ro_actions.append(action.item())
-        ro_logp.append(logp.item())
-        ro_rewards.append(reward)
-        ro_dones.append(terminated)
-        ro_values.append(value.item())
+        # store transition
+        o_buf.append(obs)
+        a_buf.append(a.item())
+        logp_buf.append(logp.item())
+        r_buf.append(rew)
+        d_buf.append(done)
+        v_buf.append(v.item())
 
-        ep_reward += reward
-        obs = next_obs
-        timesteps += 1
+        ep_ret += rew
+        obs = new_obs
+        steps += 1
 
-        if terminated:
-            obs = env.reset()[0]
-            ep_rewards.append(ep_reward)
-            ep_reward = 0.0
+        if done:
+            obs, _ = env.reset()
+            ep_buf.append(ep_ret)
+            ep_ret = 0.0
 
-        # when rollout buffer full -> update
-        if len(ro_obs) == rollout_len:
+        if len(o_buf) == rollout:
             obs_t = torch.tensor(obs, dtype=torch.float32, device=device).unsqueeze(0)
             with torch.no_grad():
-                _, _, _, next_val = model.act(obs_t)
-            adv, ret = compute_gae(ro_rewards, ro_values, ro_dones, next_val.item(), gamma, lam)
+                _, _, _, next_v = model.act(obs_t)
+            adv, ret = gae(r_buf, v_buf, d_buf, next_v.item(), gamma, lam)
 
-            ppo_update(model, optimizer, clip_eps,
-                       ro_obs, ro_actions, ro_logp, ret, adv,
-                       batch_size, update_epochs)
+            ppo_update(model, opt, clip_eps,
+                       o_buf, a_buf, logp_buf, ret, adv,
+                       batch, epochs)
 
-            # clear buffer
-            ro_obs.clear(); ro_actions.clear(); ro_logp.clear();
-            ro_rewards.clear(); ro_dones.clear(); ro_values.clear()
+            o_buf.clear(); a_buf.clear(); logp_buf.clear();
+            r_buf.clear(); d_buf.clear(); v_buf.clear()
 
-            # log moving‑average every update when buffer fills and enough episodes gathered
-            if len(ep_rewards) == ep_rewards.maxlen:
-                avg_r = np.mean(ep_rewards)
-                prog_timesteps.append(timesteps)
-                prog_avg_r.append(avg_r)
-                print(f"Timesteps: {timesteps}\tAvg Reward (100‑episode MA): {avg_r:.2f}")
+            if len(ep_buf) == ep_buf.maxlen:
+                avg_r = np.mean(ep_buf)
+                t_log.append(steps)
+                r_log.append(avg_r)
+                print(f"Steps: {steps}\tAvg Reward (100‑ep MA): {avg_r:.2f}")
 
     env.close()
 
-    if plot and prog_timesteps:
+    if plot and t_log:
         plt.figure()
-        plt.plot(prog_timesteps, prog_avg_r)
+        plt.plot(t_log, r_log)
         plt.xlabel('Timesteps')
         plt.ylabel('Average Reward (100‑episode MA)')
-        plt.title('PPO on CartPole‑v1')
+        plt.title('PPO on CartPole‑v1 ')
         plt.grid(True)
         plt.savefig('learning_curve.png')
-        print('Learning curve saved as learning_curve.png')
+        print('Saved learning_curve.png')
 
     return model
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     train()
